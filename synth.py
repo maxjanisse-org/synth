@@ -5,34 +5,265 @@ import numpy as np
 import sounddevice as sd
 import mido
 import argparse
-import random
+import threading
+from enum import Enum
 from pprint import pprint
 
-notes = ['C', 'D♭/C♯', 'D', 'E♭/D♯', 'E', 'F', 'G♭/F♯', 'G', 'A♭/G♯', 'A', 'B♭/A♯', 'B']
-
-def midi_to_note(midi):
-    note_idx = midi % 12
-    octave = (midi // 12) - 1
-    freq = midi_to_freq(midi)
-    return (notes[note_idx], octave, freq, midi)
+DEFAULT_VOICE = "sawtooth"
+SAMPLE_RATE = 48000
+BLOCKSIZE = 512
 
 def midi_to_freq(midi): return 440 * (2 ** ((midi - 69) / 12))
 
-def generate_sawtooth(f, t, harmonics=50):
-    sawtooth_fourier = np.zeros_like(t)
+def generate_sawtooth(frequency, sample_count, phase, sample_rate, harmonics=50):
+    t = (np.arange(sample_count) / sample_rate) + phase / (2 * np.pi * frequency)
 
+    wave = np.zeros(sample_count, dtype=np.float32)
     for k in range(1, harmonics + 1):
-        sawtooth_fourier += ((-1)**(k+1)) * (np.sin(2 * np.pi * k * f * t) / k)
+        wave += ((-1)**(k+1)) * (np.sin(2 * np.pi * k * frequency * t) / k)
+    wave *= (2 / np.pi)
 
-    sawtooth_fourier *= (2 / np.pi)
-    return sawtooth_fourier
+    new_phase = (2 * np.pi * frequency * sample_count / sample_rate + phase) % (2 * np.pi)
+
+    return wave, new_phase
+
+class Note:
+    def __init__(self, midi, voice, envelope, sample_rate):
+        self.freq = midi_to_freq(midi.note)
+        self.velocity = midi.velocity
+        self.phase = 0.0
+        self.sample_rate = sample_rate
+        self.voice = voice
+        self.envelope = envelope
+        self.envelope.on(self.velocity)
+
+    @property
+    def finished(self):
+        return self.envelope.finished
+    
+    def off(self):
+        self.envelope.off()
+
+    def render(self, sample_count):
+        wave, self.phase = None, self.phase
+        match self.voice:
+            case "sine":     pass
+            case "square":   pass
+            case "triangle": pass
+            case "sawtooth": wave, self.phase = generate_sawtooth(self.freq, sample_count, self.phase, self.sample_rate)
+            case _: raise ValueError(f"unable to render note in unrecognized voice: {self.voice}")
+        envelope = self.envelope.render(sample_count)
+        return wave * envelope
+
+class ADSR(Enum):
+    IDLE     = 0
+    ATTACK   = 1
+    DECAY    = 2
+    SUSTAIN  = 3
+    RELEASE  = 4
+
+class Envelope:
+    def __init__(self, attack, decay, sustain, release, sample_rate):
+        self.attack = attack
+        self.decay = decay
+        self.sustain = sustain
+        self.release = release
+        self.sample_rate = sample_rate
+        self._stage = ADSR.IDLE
+        self.peak = 1.0
+        self.level = 0.0
+
+    @property
+    def finished(self):
+        return self._stage == ADSR.IDLE
+    
+    def on(self, velocity):
+        self.peak = velocity / 127.0
+        self._stage = ADSR.ATTACK
+
+    def off(self):
+        print("envelope turning off from: ", self._stage)
+        if self._stage != ADSR.IDLE:
+            self._stage = ADSR.RELEASE
+
+    def render(self, sample_count):
+        result = np.empty(sample_count)
+
+        i = 0
+        while i < sample_count:
+            remaining = sample_count - i
+            chunk = []
+            match self._stage:
+                case ADSR.ATTACK:  chunk = self._attack(remaining)
+                case ADSR.DECAY:   chunk = self._decay(remaining)
+                case ADSR.SUSTAIN:
+                    print("sustain")
+                    result[i:i+remaining] = self.level
+                    i += remaining
+                    continue
+                case ADSR.RELEASE: 
+                    chunk = self._release(result, i, remaining)
+                    i = sample_count
+                    break
+                case _: 
+                    result[i:] = 0.0
+                    i = sample_count
+                    continue
+            
+            result[i:i+len(chunk)] = chunk
+            i += len(chunk)
+
+        return result
+    
+    def _attack(self, remaining):
+        print("attack")
+        rate = self.peak / max(self.attack * self.sample_rate, 1)
+        steps = min(remaining, int(np.ceil((self.peak - self.level) / rate)))
+        chunk = np.linspace(self.level, self.level + rate * steps, steps, endpoint=False)
+
+        #pprint({ "rate": rate, "steps": steps, "peak": self.peak, "level": self.level, "tail": chunk[-1] })
+        self.level = self.level + rate
+        if self.level >= self.peak:
+            self.level = self.peak
+            self._stage = ADSR.DECAY
+        return chunk
+
+    def _decay(self, remaining):
+        print("decay")
+        target = self.sustain * self.peak
+        rate   = (self.peak - target) / max(self.decay * self.sample_rate, 1)
+        steps  = min(remaining, int(np.ceil((self.level - target) / max(rate, 1e-9))))
+        chunk  = np.linspace(self.level, self.level - rate * steps, steps, endpoint=False)
+
+        pprint({ "target": target, "rate": rate, "steps": steps, "peak": self.peak, "level": self.level, "tail": chunk[-1] })
+        self.level = self.level - rate #float(chunk[-1]) if len(chunk) else self.level
+        if self.level <= target:
+            self.level = target
+            self._stage = ADSR.SUSTAIN
+        return chunk
+
+    def _release(self, out, i, remaining):
+        #print("release")
+        rate  = self.level / max(self.release * self.sample_rate, 1)
+        steps = min(remaining,
+                    int(np.ceil(self.level / max(rate, 1e-9))))
+        chunk = np.linspace(self.level, max(0.0, self.level - rate * steps),
+                            steps, endpoint=False)
+        self.level = float(chunk[-1]) if float(chunk[-1]) > 1e-3 else 0.0
+        out[i:i+len(chunk)] = chunk
+        i += len(chunk)
+        if self.level <= 0.0:
+            self.level = 0.0
+            out[i:] = 0.0
+            self._stage = ADSR.IDLE
+        return chunk
+
+class Synth:
+    def __init__(self, voice, envelope, sample_rate, volume):
+        self._notes = {}
+        self._voice = voice
+        self._envelope = envelope
+        self._sample_rate = sample_rate
+        self._volume = volume
+        self._stream = None
+        self._lock = threading.Lock()
+    
+    def _note_on(self, midi_msg):
+        if midi_msg.velocity == 0:
+            self._note_off(midi_msg)
+            return
+        with self._lock:
+            self._notes[midi_msg.note] = Note(
+                midi_msg, 
+                self._voice, 
+                self._envelope, 
+                self._sample_rate
+            )
+
+    def _note_off(self, midi_msg):
+        with self._lock:
+            if midi_msg.note in self._notes:
+                print("turning off", midi_msg.note)
+                self._notes[midi_msg.note].off()
+
+    def _all_off(self):
+        with self._lock:
+            for note in self._notes.values():
+                note.off()
+
+    def _clear(self):
+        with self._lock:
+            self._notes.clear()
+
+    def handle(self, msg):
+        match msg.type:
+            case "note_on":  self._note_on(msg)
+            case "note_off": self._note_off(msg)
+
+        if msg.is_cc():
+            if msg.control == 120 or msg.control == 123:
+                self._all_off()
+                self._clear()
+
+    def start(self):
+        self._stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCKSIZE,
+            channels=1,
+            dtype="float32",
+            callback=self._callback
+        )
+        self._stream.start()
+        print(f"Synthesizer started {SAMPLE_RATE} sample/sec, {BLOCKSIZE}")
+
+    def stop(self):
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        print(f"Synthesizer stopped")
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self._lock:
+            if not self._notes:
+                outdata[:] = 0
+                return
+            mix = np.zeros(frames, dtype=np.float32)
+            finished = []
+            for midi, note in self._notes.items():
+                mix += note.render(frames)
+                if note.finished:
+                    finished.append(midi)
+            for midi in finished:
+                print("finished", finished)
+                del self._notes[midi]
+
+        mix = np.tanh(mix * self._volume)
+        outdata[:] = mix.reshape(-1, 1)
+
+def determine_amplitude(db): return 10 ** (db / 20)
 
 def main(args):
-    with mido.open_input(name=args.name, virtual=True) as inport:
-        print(f"Listening on '{inport.name}'....")
-        for msg in inport:
+    envelope = Envelope(
+        attack=args.attack,
+        decay=args.decay,
+        sustain=args.sustain,
+        release=args.release,
+        sample_rate=SAMPLE_RATE
+    )
+    synth = Synth(
+        voice=args.voice,
+        envelope=envelope,
+        sample_rate=SAMPLE_RATE,
+        volume=determine_amplitude(args.volume)
+    )
+    synth.start()
+    with mido.open_input(name=args.name, virtual=True) as port:
+        print(f"Listening on '{port.name}'....")
+        for msg in port:
             print(msg)
-
+            synth.handle(msg)
+    print("Exiting...")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Personal MIDI synthesizer")
@@ -68,11 +299,32 @@ if __name__ == "__main__":
         "--noise", action="store_true",
         help="add a source of white noise to the synth."
     )
+    parser.add_argument(
+        "--attack", type=float, default=0.01,
+        help="set the attack time of the ASDR envelope in milliseconds."
+    )
+    parser.add_argument(
+        "--decay", type=float, default=0.15,
+        help="set the decay time of the ASDR envelope in milliseconds."
+    )
+    parser.add_argument(
+        "--sustain", type=float, default=0.7,
+        help="set the sustain time of the ASDR envelope in milliseconds."
+    )
+    parser.add_argument(
+        "--release", type=float, default=.3,
+        help="set the release time of the ASDR envelope in milliseconds."
+    )
     args = parser.parse_args()
 
+    args.voice = DEFAULT_VOICE
+    
     if [args.sine, args.square, args.triangle].count(True) > 1:
         print("Only one wave type can be enabled")
         exit(1)
+    elif args.sine:     args.voice = "sine"
+    elif args.square:   args.voice = "square"
+    elif args.triangle: args.voice = "triangle"
     
     if args.midi_devices:
         print("MIDI Output Devices:")
