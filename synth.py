@@ -15,6 +15,42 @@ BLOCKSIZE = 512
 
 def midi_to_freq(midi): return 440 * (2 ** ((midi - 69) / 12))
 
+def generate_sine(frequency, sample_count, phase, sample_rate):
+    if frequency == 0.0:
+        return np.zeros(sample_count, dtype=np.float32)
+
+    phase_increment = frequency / sample_rate
+    phases = (phase + np.arange(sample_count) * phase_increment) % 1.0
+    new_phase = (phase + sample_count * phase_increment) % 1.0
+
+    wave = np.sin(2.0 * np.pi * phases)
+
+    return wave, new_phase
+
+def generate_triangle(frequency, sample_count, phase, sample_rate):
+    if frequency == 0.0:
+        return np.zeros(sample_count, dtype=np.float32)
+
+    phase_increment = frequency / sample_rate
+    phases = (phase + np.arange(sample_count) * phase_increment) % 1.0
+    new_phase = (phase + sample_count * phase_increment) % 1.0
+
+    wave = 1.0 - 4.0 * np.abs(phases - 0.5)
+
+    return wave, new_phase
+
+def generate_square(frequency, sample_count, phase, sample_rate):
+    if frequency == 0.0:
+        return np.zeros(sample_count, dtype=np.float32)
+    
+    phase_increment = frequency / sample_rate
+    phases = (phase + np.arange(sample_count) * phase_increment) % 1.0
+    new_phase = (phase + sample_count * phase_increment) % 1.0
+    
+    wave = np.where(phases < 0.5, 1.0, -1.0)
+    
+    return wave, new_phase
+
 def generate_sawtooth(frequency, sample_count, phase, sample_rate, harmonics=50):
     t = (np.arange(sample_count) / sample_rate) + phase / (2 * np.pi * frequency)
 
@@ -47,9 +83,9 @@ class Note:
     def render(self, sample_count):
         wave, self.phase = None, self.phase
         match self.voice:
-            case "sine":     pass
-            case "square":   pass
-            case "triangle": pass
+            case "sine":     wave, self.phase = generate_sine(self.freq, sample_count, self.phase, self.sample_rate)
+            case "square":   wave, self.phase = generate_square(self.freq, sample_count, self.phase, self.sample_rate)
+            case "triangle": wave, self.phase = generate_triangle(self.freq, sample_count, self.phase, self.sample_rate)
             case "sawtooth": wave, self.phase = generate_sawtooth(self.freq, sample_count, self.phase, self.sample_rate)
             case _: raise ValueError(f"unable to render note in unrecognized voice: {self.voice}")
         envelope = self.envelope.render(sample_count)
