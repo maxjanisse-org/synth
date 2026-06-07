@@ -304,7 +304,7 @@ if __name__ == "__main__":
         help="set the attack time of the ASDR envelope in milliseconds."
     )
     parser.add_argument(
-        "--decay", type=float, default=0.15,
+        "--decay", type=float, default=0.015,
         help="set the decay time of the ASDR envelope in milliseconds."
     )
     parser.add_argument(
@@ -312,7 +312,7 @@ if __name__ == "__main__":
         help="set the sustain time of the ASDR envelope in milliseconds."
     )
     parser.add_argument(
-        "--release", type=float, default=.3,
+        "--release", type=float, default=0.01,
         help="set the release time of the ASDR envelope in milliseconds."
     )
     args = parser.parse_args()
