@@ -101,14 +101,10 @@ class Envelope:
                     result[i:i+remaining] = self.level
                     i += remaining
                     continue
-                case ADSR.RELEASE: 
-                    chunk = self._release(result, i, remaining)
-                    i = sample_count
-                    break
+                case ADSR.RELEASE: chunk = self._release(remaining)
                 case _: 
                     result[i:] = 0.0
-                    i = sample_count
-                    continue
+                    break
             
             result[i:i+len(chunk)] = chunk
             i += len(chunk)
@@ -121,8 +117,7 @@ class Envelope:
         steps = min(remaining, int(np.ceil((self.peak - self.level) / rate)))
         chunk = np.linspace(self.level, self.level + rate * steps, steps, endpoint=False)
 
-        #pprint({ "rate": rate, "steps": steps, "peak": self.peak, "level": self.level, "tail": chunk[-1] })
-        self.level = self.level + rate
+        self.level += rate * steps
         if self.level >= self.peak:
             self.level = self.peak
             self._stage = ADSR.DECAY
@@ -135,26 +130,24 @@ class Envelope:
         steps  = min(remaining, int(np.ceil((self.level - target) / max(rate, 1e-9))))
         chunk  = np.linspace(self.level, self.level - rate * steps, steps, endpoint=False)
 
-        pprint({ "target": target, "rate": rate, "steps": steps, "peak": self.peak, "level": self.level, "tail": chunk[-1] })
-        self.level = self.level - rate #float(chunk[-1]) if len(chunk) else self.level
+        self.level -= rate * steps
         if self.level <= target:
             self.level = target
             self._stage = ADSR.SUSTAIN
         return chunk
 
-    def _release(self, out, i, remaining):
-        #print("release")
+    def _release(self, remaining):
+        print("release")
         rate  = self.level / max(self.release * self.sample_rate, 1)
-        steps = min(remaining,
-                    int(np.ceil(self.level / max(rate, 1e-9))))
-        chunk = np.linspace(self.level, max(0.0, self.level - rate * steps),
-                            steps, endpoint=False)
-        self.level = float(chunk[-1]) if float(chunk[-1]) > 1e-3 else 0.0
-        out[i:i+len(chunk)] = chunk
-        i += len(chunk)
+        steps = min(remaining, int(np.ceil(self.level / max(rate, 1e-9))))
+        chunk = np.linspace(self.level, max(0.0, self.level - rate * steps), steps, endpoint=False)
+        
+        self.level = float(chunk[-1]) if len(chunk) and float(chunk[-1]) > 1e-3 else 0.0
+        i = remaining - len(chunk)
         if self.level <= 0.0:
             self.level = 0.0
-            out[i:] = 0.0
+            if i > 0:
+                chunk[i:] = 0.0
             self._stage = ADSR.IDLE
         return chunk
 
