@@ -96,21 +96,17 @@ class Envelope:
             match self._stage:
                 case ADSR.ATTACK:  chunk = self._attack(remaining)
                 case ADSR.DECAY:   chunk = self._decay(remaining)
-                case ADSR.SUSTAIN:
-                    print("sustain")
-                    result[i:i+remaining] = self.level
-                    i += remaining
-                    continue
+                case ADSR.SUSTAIN: chunk = self._sustain(remaining)
                 case ADSR.RELEASE: chunk = self._release(remaining)
-                case _: 
-                    result[i:] = 0.0
-                    break
+                case _:            chunk = self._idle(remaining)
             
             result[i:i+len(chunk)] = chunk
             i += len(chunk)
 
         return result
-    
+
+    def _idle(self, remaining): return [0.0] * remaining
+
     def _attack(self, remaining):
         print("attack")
         rate = self.peak / max(self.attack * self.sample_rate, 1)
@@ -136,6 +132,10 @@ class Envelope:
             self._stage = ADSR.SUSTAIN
         return chunk
 
+    def _sustain(self, remaining):
+        print("sustain")
+        return [self.level] * remaining
+
     def _release(self, remaining):
         print("release")
         rate  = self.level / max(self.release * self.sample_rate, 1)
@@ -143,10 +143,9 @@ class Envelope:
         chunk = np.linspace(self.level, max(0.0, self.level - rate * steps), steps, endpoint=False)
         
         self.level = float(chunk[-1]) if len(chunk) and float(chunk[-1]) > 1e-3 else 0.0
-        i = remaining - len(chunk)
         if self.level <= 0.0:
             self.level = 0.0
-            if i > 0:
+            if (remaining - len(chunk)) > 0:
                 chunk[i:] = 0.0
             self._stage = ADSR.IDLE
         return chunk
