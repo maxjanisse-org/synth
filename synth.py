@@ -1,13 +1,11 @@
 # Max Janisse (c) 2026
 # <mjanisse@pdx.edu>
-import scipy.io.wavfile as wav
 import numpy as np
 import sounddevice as sd
 import mido
 import argparse
 import threading
 from enum import Enum
-from pprint import pprint
 
 DEFAULT_VOICE = "sawtooth"
 SAMPLE_RATE = 48000
