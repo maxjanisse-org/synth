@@ -10,6 +10,7 @@ from enum import Enum
 DEFAULT_VOICE = "sawtooth"
 SAMPLE_RATE = 48000
 BLOCKSIZE = 512
+MAX_VOICES = 16
 
 def midi_to_freq(midi): return 440 * (2 ** ((midi - 69) / 12))
 
@@ -62,13 +63,14 @@ def generate_sawtooth(frequency, sample_count, phase, sample_rate, harmonics=50)
     return wave, new_phase
 
 class Note:
-    def __init__(self, midi, voice, envelope, sample_rate):
+    def __init__(self, midi, voice, adsr, sample_rate, verbose=False):
         self.freq = midi_to_freq(midi.note)
         self.velocity = midi.velocity
         self.phase = 0.0
         self.sample_rate = sample_rate
         self.voice = voice
-        self.envelope = envelope
+        a, d, s, r = adsr
+        self.envelope = Envelope(a, d, s, r, sample_rate, verbose)
         self.envelope.on(self.velocity)
 
     @property
@@ -97,12 +99,13 @@ class ADSR(Enum):
     RELEASE  = 4
 
 class Envelope:
-    def __init__(self, attack, decay, sustain, release, sample_rate):
+    def __init__(self, attack, decay, sustain, release, sample_rate, verbose=False):
         self.attack = attack
         self.decay = decay
         self.sustain = sustain
         self.release = release
         self.sample_rate = sample_rate
+        self.verbose = verbose
         self._stage = ADSR.IDLE
         self.peak = 1.0
         self.level = 0.0
@@ -116,7 +119,6 @@ class Envelope:
         self._stage = ADSR.ATTACK
 
     def off(self):
-        print("envelope turning off from: ", self._stage)
         if self._stage != ADSR.IDLE:
             self._stage = ADSR.RELEASE
 
@@ -142,9 +144,10 @@ class Envelope:
     def _idle(self, remaining): return [0.0] * remaining
 
     def _attack(self, remaining):
-        print("attack")
+        if self.verbose:
+            print("attack")
         rate = self.peak / max(self.attack * self.sample_rate, 1)
-        steps = min(remaining, int(np.ceil((self.peak - self.level) / rate)))
+        steps = abs(min(remaining, int(np.ceil((self.peak - self.level) / rate))))
         chunk = np.linspace(self.level, self.level + rate * steps, steps, endpoint=False)
 
         self.level += rate * steps
@@ -154,7 +157,8 @@ class Envelope:
         return chunk
 
     def _decay(self, remaining):
-        print("decay")
+        if self.verbose:
+            print("decay")
         target = self.sustain * self.peak
         rate   = (self.peak - target) / max(self.decay * self.sample_rate, 1)
         steps  = min(remaining, int(np.ceil((self.level - target) / max(rate, 1e-9))))
@@ -167,30 +171,34 @@ class Envelope:
         return chunk
 
     def _sustain(self, remaining):
-        print("sustain")
+        if self.verbose:
+            print("sustain")
         return [self.level] * remaining
 
     def _release(self, remaining):
-        print("release")
+        if self.verbose:
+            print("release")
         rate  = self.level / max(self.release * self.sample_rate, 1)
         steps = min(remaining, int(np.ceil(self.level / max(rate, 1e-9))))
         chunk = np.linspace(self.level, max(0.0, self.level - rate * steps), steps, endpoint=False)
         
         self.level = float(chunk[-1]) if len(chunk) and float(chunk[-1]) > 1e-3 else 0.0
+        i = remaining - len(chunk)
         if self.level <= 0.0:
             self.level = 0.0
-            if (remaining - len(chunk)) > 0:
+            if i > 0:
                 chunk[i:] = 0.0
             self._stage = ADSR.IDLE
         return chunk
 
 class Synth:
-    def __init__(self, voice, envelope, sample_rate, volume):
+    def __init__(self, voice, adsr, sample_rate, volume, verbose=False):
+        self._adsr = adsr
         self._notes = {}
         self._voice = voice
-        self._envelope = envelope
         self._sample_rate = sample_rate
         self._volume = volume
+        self.verbose = verbose
         self._stream = None
         self._lock = threading.Lock()
     
@@ -199,17 +207,22 @@ class Synth:
             self._note_off(midi_msg)
             return
         with self._lock:
+            if len(self._notes) >= MAX_VOICES:
+                oldest = next(iter(self._notes))
+                del self._notes[oldest]
             self._notes[midi_msg.note] = Note(
                 midi_msg, 
-                self._voice, 
-                self._envelope, 
-                self._sample_rate
+                self._voice,
+                self._adsr, 
+                self._sample_rate,
+                self.verbose
             )
 
     def _note_off(self, midi_msg):
         with self._lock:
             if midi_msg.note in self._notes:
-                print("turning off", midi_msg.note)
+                if self.verbose:
+                    print("turning off", midi_msg.note)
                 self._notes[midi_msg.note].off()
 
     def _all_off(self):
@@ -240,7 +253,7 @@ class Synth:
             callback=self._callback
         )
         self._stream.start()
-        print(f"Synthesizer started {SAMPLE_RATE} sample/sec, {BLOCKSIZE}")
+        print(f"Synthesizer started {SAMPLE_RATE} sample/sec w/ blocksize of {BLOCKSIZE}")
 
     def stop(self):
         if self._stream is not None:
@@ -261,7 +274,8 @@ class Synth:
                 if note.finished:
                     finished.append(midi)
             for midi in finished:
-                print("finished", finished)
+                if self.verbose:
+                    print("finished", midi)
                 del self._notes[midi]
 
         mix = np.tanh(mix * self._volume)
@@ -270,29 +284,31 @@ class Synth:
 def determine_amplitude(db): return 10 ** (db / 20)
 
 def main(args):
-    envelope = Envelope(
-        attack=args.attack,
-        decay=args.decay,
-        sustain=args.sustain,
-        release=args.release,
-        sample_rate=SAMPLE_RATE
-    )
+    if args.verbose:
+        pass
+    
     synth = Synth(
         voice=args.voice,
-        envelope=envelope,
+        adsr=(args.attack, args.decay, args.sustain, args.release),
         sample_rate=SAMPLE_RATE,
-        volume=determine_amplitude(args.volume)
+        volume=determine_amplitude(args.volume),
+        verbose=args.verbose
     )
     synth.start()
     with mido.open_input(name=args.name, virtual=True) as port:
         print(f"Listening on '{port.name}'....")
         for msg in port:
-            print(msg)
+            if args.verbose:
+                print(msg)
             synth.handle(msg)
     print("Exiting...")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Personal MIDI synthesizer")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="enable more detailed output."
+    )
     parser.add_argument(
         "--volume", type=int, default=-3,
         help="adjust the volume in decibels (dB). Default is -3dB."
