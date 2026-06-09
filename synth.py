@@ -81,7 +81,7 @@ class Note:
         self.envelope.off()
 
     def render(self, sample_count):
-        wave, self.phase = None, self.phase
+        wave = None
         match self.voice:
             case "sine":     wave, self.phase = generate_sine(self.freq, sample_count, self.phase, self.sample_rate)
             case "square":   wave, self.phase = generate_square(self.freq, sample_count, self.phase, self.sample_rate)
@@ -144,7 +144,7 @@ class Envelope:
     def _idle(self, remaining): return [0.0] * remaining
 
     def _attack(self, remaining):
-        if self.verbose:
+        if self.verbose == 3:
             print("attack")
         rate = self.peak / max(self.attack * self.sample_rate, 1)
         steps = abs(min(remaining, int(np.ceil((self.peak - self.level) / rate))))
@@ -157,7 +157,7 @@ class Envelope:
         return chunk
 
     def _decay(self, remaining):
-        if self.verbose:
+        if self.verbose == 3:
             print("decay")
         target = self.sustain * self.peak
         rate   = (self.peak - target) / max(self.decay * self.sample_rate, 1)
@@ -171,12 +171,12 @@ class Envelope:
         return chunk
 
     def _sustain(self, remaining):
-        if self.verbose:
+        if self.verbose == 3:
             print("sustain")
         return [self.level] * remaining
 
     def _release(self, remaining):
-        if self.verbose:
+        if self.verbose == 3:
             print("release")
         rate  = self.level / max(self.release * self.sample_rate, 1)
         steps = min(remaining, int(np.ceil(self.level / max(rate, 1e-9))))
@@ -221,7 +221,7 @@ class Synth:
     def _note_off(self, midi_msg):
         with self._lock:
             if midi_msg.note in self._notes:
-                if self.verbose:
+                if self.verbose == 2:
                     print("turning off", midi_msg.note)
                 self._notes[midi_msg.note].off()
 
@@ -253,7 +253,7 @@ class Synth:
             callback=self._callback
         )
         self._stream.start()
-        print(f"Synthesizer started {SAMPLE_RATE} sample/sec w/ blocksize of {BLOCKSIZE}")
+        print(f"Synthesizer started")
 
     def stop(self):
         if self._stream is not None:
@@ -274,7 +274,7 @@ class Synth:
                 if note.finished:
                     finished.append(midi)
             for midi in finished:
-                if self.verbose:
+                if self.verbose == 2:
                     print("finished", midi)
                 del self._notes[midi]
 
@@ -285,7 +285,15 @@ def determine_amplitude(db): return 10 ** (db / 20)
 
 def main(args):
     if args.verbose:
-        pass
+        print(f"Voice:          {args.voice.capitalize()}")
+        print(f"Attack Time:    {args.attack*1000} ms")
+        print(f"Decay Time:     {args.decay*1000} ms")
+        print(f"Sustain Volume: {args.sustain*100}%")
+        print(f"Release Time:   {args.release*1000} ms")
+        print(f"Volume:         {args.volume} db ({determine_amplitude(args.volume)*100:.3f}%)")
+        print(f"Sample Rate:    {SAMPLE_RATE} samples/second")
+        print(f"Blocksize:      {BLOCKSIZE}")
+        print()
     
     synth = Synth(
         voice=args.voice,
@@ -297,25 +305,33 @@ def main(args):
     synth.start()
     with mido.open_input(name=args.name, virtual=True) as port:
         print(f"Listening on '{port.name}'....")
-        for msg in port:
-            if args.verbose:
-                print(msg)
-            synth.handle(msg)
-    print("Exiting...")
+        try:
+            for msg in port:
+                if args.verbose:
+                    print(msg)
+                synth.handle(msg)
+        except KeyboardInterrupt:
+            print("\nListening stopped")
+        finally:
+            synth.stop()
+            port.close()
+    print("Exiting")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Personal MIDI synthesizer")
-    parser.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="enable more detailed output."
+    parser = argparse.ArgumentParser(
+        description="Personal MIDI synthesizer using a sawtooth wave oscillator by default and implementing a configurable ADSR envelope to further shape the synthesized sound."
     )
     parser.add_argument(
-        "--volume", type=int, default=-3,
-        help="adjust the volume in decibels (dB). Default is -3dB."
+        "-v", "--verbose", action="count", default=0,
+        help="enable more detailed output. Add multiple times to increase level of verbosity (max. 3)"
     )
     parser.add_argument(
         "-n", "--name", type=str, default="MySynth",
         help="set the name of the MIDI port that will be opened"
+    )
+    parser.add_argument(
+        "--volume", type=int, default=-3,
+        help="adjust the volume in decibels (dB). Default is -3dB."
     )
     parser.add_argument(
         "--midi-port", type=int,
@@ -327,35 +343,31 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--sine", action="store_true",
-        help="use a sine wave during signal generation."
+        help="use a sine wave oscillator."
     )
     parser.add_argument(
         "--triangle", action="store_true",
-        help="use a triangle wave during signal generation."
+        help="use a triangle wave oscillator."
     )
     parser.add_argument(
         "--square", action="store_true",
-        help="use a square wave during signal generation."
-    )
-    parser.add_argument(
-        "--noise", action="store_true",
-        help="add a source of white noise to the synth."
+        help="use a square wave oscillator."
     )
     parser.add_argument(
         "--attack", type=float, default=0.01,
-        help="set the attack time of the ASDR envelope in milliseconds."
+        help="set the attack time of the ADSR envelope."
     )
     parser.add_argument(
         "--decay", type=float, default=0.015,
-        help="set the decay time of the ASDR envelope in milliseconds."
+        help="set the decay time of the ADSR envelope."
     )
     parser.add_argument(
         "--sustain", type=float, default=0.7,
-        help="set the sustain time of the ASDR envelope in milliseconds."
+        help="set the sustain percentage of the ADSR envelope."
     )
     parser.add_argument(
         "--release", type=float, default=0.01,
-        help="set the release time of the ASDR envelope in milliseconds."
+        help="set the release time of the ADSR envelope."
     )
     args = parser.parse_args()
 
